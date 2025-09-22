@@ -1,4 +1,4 @@
-# -----------------------------
+﻿# -----------------------------
 # АВТОУСТАНОВКА ЗАВИСИМОСТЕЙ ИЗ requirements.txt (жёстко, без --user)
 # -----------------------------
 import subprocess, sys, os, tempfile
@@ -43,7 +43,7 @@ from pathlib import Path
 st.set_page_config(page_title="Оценка авто — MVP", layout="centered")
 
 DEFAULT_CONTRACTOR = "ООО «Агентство «Бизнес-Актив»"
-TEMPLATE_NAME = "auto_template.docx"   # имя файла шаблона
+TEMPLATE_NAME = "mers_ocenka.docx"   # имя файла шаблона
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 GENERATED_DIR = Path(__file__).parent / "generated"
 GENERATED_DIR.mkdir(exist_ok=True)
@@ -56,6 +56,48 @@ def generate_uuid7() -> str:
 
 def safe_str_date(d: date) -> str:
     return d.strftime("%d.%m.%Y") if isinstance(d, date) else str(d)
+
+def summarize_attachments(files, failures):
+    lines = []
+    if files:
+        for idx, item in enumerate(files, start=1):
+            lines.append(f"{idx}. {item['name']}")
+    if failures:
+        lines.append("Не удалось загрузить: " + ', '.join(failures))
+    if not lines:
+        return "Файлы не загружены."
+    return '\n'.join(lines)
+
+
+IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tif', '.tiff', '.webp'}
+
+
+def _is_image_file(name: str) -> bool:
+    return Path(name or '').suffix.lower() in IMAGE_SUFFIXES
+
+
+def build_appendix_entries(doc, files, failures):
+    from docxtpl import InlineImage
+    from docx.shared import Mm
+
+    entries = []
+
+    for item in files:
+        display_name = item.get('name', 'без названия')
+        if not _is_image_file(display_name):
+            continue
+        try:
+            image_stream = io.BytesIO(item['data'])
+            image_stream.seek(0)
+            image_stream.name = display_name
+            img = InlineImage(doc, image_stream, width=Mm(140))
+        except Exception as exc:
+            failures.append(f"{display_name} (ошибка вставки: {exc})")
+            continue
+        entries.append({'image': img})
+
+    return entries
+
 
 # -----------------------------
 # МОДАЛЬНОЕ ОКНО АВТОРИЗАЦИИ
@@ -135,9 +177,66 @@ with st.form("auto_appraisal_form", clear_on_submit=False):
         price_no_vat  = st.number_input("Стоимость без учета НДС:", min_value=0.0, step=0.01, format="%.2f", key="price_no_vat")
         price_vat     = st.number_input("Стоимость с учетом НДС:",  min_value=0.0, step=0.01, format="%.2f", key="price_vat")
 
-    submitted = st.form_submit_button("Сохранить и сформировать DOCX", type="primary")
+    appendix_1_files_raw = st.file_uploader("Приложение 1", accept_multiple_files=True, key="appendix_1")
+    appendix_2_files_raw = st.file_uploader("Приложение 2", accept_multiple_files=True, key="appendix_2")
+    rights_files_raw = st.file_uploader("Подтверждение права оценщика и исполнителя заниматься оценочной деятельностью", accept_multiple_files=True, key="rights_docs")
+
+    submitted = st.form_submit_button("Сформировать и скачать DOCX", type="primary")
 
 if submitted:
+    appendix_1_files = []
+    appendix_1_failures = []
+    for uploaded_file in (appendix_1_files_raw or []):
+        try:
+            payload = uploaded_file.getvalue()
+            if not payload:
+                raise ValueError('empty payload')
+        except Exception:
+            appendix_1_failures.append(uploaded_file.name or 'без названия')
+        else:
+            appendix_1_files.append({
+                'name': uploaded_file.name or 'без названия',
+                'data': payload,
+                'size': len(payload),
+            })
+
+    appendix_2_files = []
+    appendix_2_failures = []
+    for uploaded_file in (appendix_2_files_raw or []):
+        try:
+            payload = uploaded_file.getvalue()
+            if not payload:
+                raise ValueError('empty payload')
+        except Exception:
+            appendix_2_failures.append(uploaded_file.name or 'без названия')
+        else:
+            appendix_2_files.append({
+                'name': uploaded_file.name or 'без названия',
+                'data': payload,
+                'size': len(payload),
+            })
+
+    rights_files = []
+    rights_failures = []
+    for uploaded_file in (rights_files_raw or []):
+        try:
+            payload = uploaded_file.getvalue()
+            if not payload:
+                raise ValueError('empty payload')
+        except Exception:
+            rights_failures.append(uploaded_file.name or 'без названия')
+        else:
+            rights_files.append({
+                'name': uploaded_file.name or 'без названия',
+                'data': payload,
+                'size': len(payload),
+            })
+
+    appendix_1_names = [item['name'] for item in appendix_1_files]
+    appendix_2_names = [item['name'] for item in appendix_2_files]
+    rights_names = [item['name'] for item in rights_files]
+    failed_uploads = appendix_1_failures + appendix_2_failures + rights_failures
+
     # Собираем запись
     record = {
         "user_uuid": st.session_state.get("uuid7"),
@@ -155,6 +254,12 @@ if submitted:
         "Название ТС": object_type,
         "Доп. наименование ТС": car_name,
         "VIN": vin_model,
+        "Приложение 1 (файлы)": appendix_1_names,
+        # "Приложение 1 (ошибки)": appendix_1_failures,
+        "Приложение 2 (файлы)": appendix_2_names,
+        # "Приложение 2 (ошибки)": appendix_2_failures,
+        "Подтверждение права (файлы)": rights_names,
+        # "Подтверждение права (ошибки)": rights_failures,
     }
     st.success("Данные сохранены (локально в сессии).")
     with st.expander("Проверить данные перед подстановкой в шаблон"):
@@ -181,6 +286,12 @@ if submitted:
 
         # МАППИНГ ПОЛЕЙ -> МЕТКИ {{ ... }} В ШАБЛОНЕ
         # (использую именно те ключи, которые ты перечислил)
+        doc = DocxTemplate(str(tpl_path))
+
+        appendix_1_entries = build_appendix_entries(doc, appendix_1_files, appendix_1_failures)
+        appendix_2_entries = build_appendix_entries(doc, appendix_2_files, appendix_2_failures)
+        rights_entries = build_appendix_entries(doc, rights_files, rights_failures)
+
         context = {
             # как ты указал: Основание -> {{ contract_number }} (да, дублируется)
             "contract_number": contract_no,               # Номер контракта / и по твоей строке "Основание"
@@ -197,26 +308,56 @@ if submitted:
             "cost_of_assessment": f"{price_no_vat:,.2f}".replace(",", " "),
             "cost_of_assessment_NDS": f"{price_vat:,.2f}".replace(",", " "),
         }
+        context["appendix_1_summary"] = summarize_attachments(appendix_1_files, appendix_1_failures)
+        context["appendix_2_summary"] = summarize_attachments(appendix_2_files, appendix_2_failures)
+        context["rights_summary"] = summarize_attachments(rights_files, rights_failures)
+        context["appendix_1_entries"] = appendix_1_entries
+        context["appendix_2_entries"] = appendix_2_entries
+        context["rights_entries"] = rights_entries
 
-        # Рендерим
-        doc = DocxTemplate(str(tpl_path))
         doc.render(context)
 
-        # Сохраняем на диск и отдаём на скачивание
-        out_name = f"Отчет_{contract_no or 'без_номера'}_{st.session_state.get('uuid7')}.docx"
+        out_name = f"Отчёт_{contract_no or 'без_номера'}_{st.session_state.get('uuid7')}.docx"
+
         out_path = GENERATED_DIR / out_name
+
         doc.save(str(out_path))
 
-        # Отдаём как download_button
+
+
         with open(out_path, "rb") as f:
+
             data = f.read()
+
+
+
         st.download_button(
+
             label="⬇️ Скачать сформированный DOCX",
+
             data=data,
+
             file_name=out_name,
+
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+
             type="primary"
+
         )
+
+        if failed_uploads:
+
+            st.warning(
+
+                "Не все файлы приложений были загружены: "
+
+                + ', '.join(failed_uploads)
+
+                + ". Проверьте соединение и попробуйте загрузить их повторно."
+
+            )
+
+
 
         st.info(f"Файл также сохранён локально: {out_path}")
 
