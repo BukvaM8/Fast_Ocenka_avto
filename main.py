@@ -37,10 +37,37 @@ if "reqs_installed" not in st.session_state:
 # -----------------------------
 import io
 import random
+import math
 from datetime import date
 from pathlib import Path
 
+from docx.shared import Inches
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 st.set_page_config(page_title="Оценка авто — MVP", layout="centered")
+
+
+def build_object_photos_subdoc(doc, files, per_row=2):
+    subdoc = doc.new_subdoc()
+    if not files:
+        subdoc.add_paragraph("Фотографии объекта не загружены.")
+        return subdoc
+    rows = math.ceil(len(files) / per_row)
+    table = subdoc.add_table(rows=rows, cols=per_row)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    idx = 0
+    for r in range(rows):
+        for c in range(per_row):
+            cell = table.cell(r, c)
+            for paragraph in cell.paragraphs:
+                paragraph.text = ""
+            if idx < len(files):
+                image_stream = io.BytesIO(files[idx]['data'])
+                run = cell.paragraphs[0].add_run()
+                run.add_picture(image_stream, width=Inches(3.0))
+                cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                idx += 1
+    return subdoc
 
 DEFAULT_CONTRACTOR = "ООО «Агентство «Бизнес-Актив»"
 TEMPLATE_NAME = "mers_ocenka.docx"   # имя файла шаблона
@@ -162,26 +189,30 @@ with st.form("auto_appraisal_form", clear_on_submit=False):
         basis         = st.text_input("Основание", key="basis")
         valuation_date= st.date_input("Дата оценки:", value=date.today(), key="valuation_date")
         report_date   = st.date_input("Дата составления Отчета об оценке:", value=date.today(), key="report_date")
-        otchet_number = st.text_input("Номер отчёта", key="otchet_number")
-        object_type   = st.text_input("Название ТС (объект оценки)", key="object_type")
+        otchet_number = st.text_input("Номер отчета", key="otchet_number")
+        object_type   = st.text_input("Тип оцениваемого объекта", key="object_type")
+        car_number    = st.text_input("Регистрационный номер автомобиля", key="car_number")
 
     with col2:
-        car_name      = st.text_input("Доп. наименование ТС (ещё одно)", key="car_name")
+        car_name      = st.text_input("Наим. транспортного средства", key="car_name")
         vin_model     = st.text_input("VIN", key="vin_model")
         customer      = st.text_input("Заказчик:", key="customer")
         contractor    = st.text_input(
-            "Подрядчик:",
+            "Исполнитель:",
             key="contractor",
-            help="По умолчанию подставляется ООО «Агентство «Бизнес-Актив», можно изменить."
+            help="По умолчанию подставляется ООО «Агентство «Бизнес-Актив», измени при необходимости."
         )
-        price_no_vat  = st.number_input("Стоимость без учета НДС:", min_value=0.0, step=0.01, format="%.2f", key="price_no_vat")
-        price_vat     = st.number_input("Стоимость с учетом НДС:",  min_value=0.0, step=0.01, format="%.2f", key="price_vat")
+        price_no_vat  = st.number_input("Стоимость без НДС:", min_value=0.0, step=0.01, format="%.2f", key="price_no_vat")
+        price_vat     = st.number_input("Стоимость с НДС:",  min_value=0.0, step=0.01, format="%.2f", key="price_vat")
 
+    object_photos_raw = st.file_uploader("Фотографии объекта оценки", accept_multiple_files=True, key="object_photos")
     appendix_1_files_raw = st.file_uploader("Приложение 1", accept_multiple_files=True, key="appendix_1")
     appendix_2_files_raw = st.file_uploader("Приложение 2", accept_multiple_files=True, key="appendix_2")
     rights_files_raw = st.file_uploader("Подтверждение права оценщика и исполнителя заниматься оценочной деятельностью", accept_multiple_files=True, key="rights_docs")
 
     submitted = st.form_submit_button("Сформировать и скачать DOCX", type="primary")
+
+
 
 if submitted:
     appendix_1_files = []
@@ -232,10 +263,27 @@ if submitted:
                 'size': len(payload),
             })
 
+    object_photos = []
+    object_photo_failures = []
+    for uploaded_file in (object_photos_raw or []):
+        try:
+            payload = uploaded_file.getvalue()
+            if not payload:
+                raise ValueError('empty payload')
+        except Exception:
+            object_photo_failures.append(uploaded_file.name or 'без названия')
+        else:
+            object_photos.append({
+                'name': uploaded_file.name or 'без названия',
+                'data': payload,
+                'size': len(payload),
+            })
+
     appendix_1_names = [item['name'] for item in appendix_1_files]
     appendix_2_names = [item['name'] for item in appendix_2_files]
     rights_names = [item['name'] for item in rights_files]
-    failed_uploads = appendix_1_failures + appendix_2_failures + rights_failures
+    object_photo_names = [item['name'] for item in object_photos]
+    failed_uploads = appendix_1_failures + appendix_2_failures + rights_failures + object_photo_failures
 
     # Собираем запись
     record = {
@@ -252,6 +300,7 @@ if submitted:
         "Стоимость без НДС": price_no_vat,
         "Номер отчёта": otchet_number,
         "Название ТС": object_type,
+        "Регистрационный номер автомобиля": car_number,
         "Доп. наименование ТС": car_name,
         "VIN": vin_model,
         "Приложение 1 (файлы)": appendix_1_names,
@@ -260,6 +309,7 @@ if submitted:
         # "Приложение 2 (ошибки)": appendix_2_failures,
         "Подтверждение права (файлы)": rights_names,
         # "Подтверждение права (ошибки)": rights_failures,
+        "Фотографии объекта": object_photo_names,
     }
     st.success("Данные сохранены (локально в сессии).")
     with st.expander("Проверить данные перед подстановкой в шаблон"):
@@ -314,6 +364,7 @@ if submitted:
         context["appendix_1_entries"] = appendix_1_entries
         context["appendix_2_entries"] = appendix_2_entries
         context["rights_entries"] = rights_entries
+        context["object_ocenki"] = build_object_photos_subdoc(doc, object_photos)
 
         doc.render(context)
 
