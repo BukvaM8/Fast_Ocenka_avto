@@ -43,14 +43,17 @@ from pathlib import Path
 
 from docx.shared import Inches
 from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+
 st.set_page_config(page_title="Оценка авто — MVP", layout="centered")
 
 
-def build_object_photos_subdoc(doc, files, per_row=2):
+def build_photos_subdoc(doc, files, per_row=2, empty_message="Фотографии не загружены."):
     subdoc = doc.new_subdoc()
     if not files:
-        subdoc.add_paragraph("Фотографии объекта не загружены.")
+        if empty_message:
+            subdoc.add_paragraph(empty_message)
         return subdoc
     rows = math.ceil(len(files) / per_row)
     table = subdoc.add_table(rows=rows, cols=per_row)
@@ -126,6 +129,134 @@ def build_appendix_entries(doc, files, failures):
     return entries
 
 
+ANALOG_EMPTY_TITLE = "без названия"
+MAX_ANALOGS = 10
+ANALOG_TITLE_TEMPLATE = "Предложение по продаже транспортного средства (объект-аналог №{index})"
+
+
+def ensure_analog_state():
+    slots = st.session_state.setdefault("analog_slots", [1])
+    if "analog_counter" not in st.session_state:
+        st.session_state["analog_counter"] = max(slots) if slots else 0
+
+
+def add_analog_slot():
+    ensure_analog_state()
+    slots = list(st.session_state["analog_slots"])
+    if len(slots) >= MAX_ANALOGS:
+        return
+    counter = st.session_state.get("analog_counter", 0) + 1
+    st.session_state["analog_counter"] = counter
+    slots.append(counter)
+    st.session_state["analog_slots"] = slots
+
+
+def remove_analog_slot(slot_id: int):
+    slots = [s for s in st.session_state.get("analog_slots", []) if s != slot_id]
+    st.session_state["analog_slots"] = slots
+    st.session_state.pop(f"analog_title_{slot_id}", None)
+    st.session_state.pop(f"analog_files_{slot_id}", None)
+    st.session_state.pop(f"analog_source_{slot_id}", None)
+
+
+def default_analog_heading(index: int) -> str:
+    return ANALOG_TITLE_TEMPLATE.format(index=index)
+
+
+def format_analog_source_text(text: str) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    lower_cleaned = cleaned.lower()
+    prefix = "источник информации"
+    if lower_cleaned.startswith(prefix):
+        return cleaned
+    if not cleaned.startswith("(") and not cleaned.endswith(")"):
+        cleaned = f"({cleaned})"
+    return f"Источник информации: {cleaned}"
+
+
+def format_analog_source(text: str):
+    formatted = format_analog_source_text(text)
+    if not formatted:
+        return ""
+    from docxtpl import RichText
+    rt = RichText()
+    rt.add(formatted, italic=True)
+    return rt
+
+
+def paragraph_has_drawings(paragraph):
+    for run in paragraph.runs:
+        if run._element.xpath('.//w:drawing'):
+            return True
+    return False
+
+
+def paragraph_has_page_break(paragraph):
+    for run in paragraph.runs:
+        for br in run._element.xpath('.//w:br'):
+            br_type = br.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}type')
+            if br_type in (None, 'page'):
+                return True
+    return False
+
+
+def paragraph_has_content(paragraph):
+    return bool(paragraph.text.strip()) or paragraph_has_drawings(paragraph)
+
+
+def cleanup_unused_analog_pages(doc_path, analog_count):
+    doc = Document(doc_path)
+    import re
+    paragraphs = doc.paragraphs
+    analog_pattern = re.compile(r'объект-аналог\s*№\s*(\d+)', re.IGNORECASE)
+    last_idx = -1
+    for idx, paragraph in enumerate(paragraphs):
+        match = analog_pattern.search(paragraph.text)
+        if match:
+            try:
+                number = int(match.group(1))
+            except ValueError:
+                continue
+            if number <= analog_count:
+                last_idx = idx
+    start_idx = last_idx + 1 if analog_count else 0
+    removed_any = False
+    i = start_idx
+    while i < len(doc.paragraphs):
+        paragraphs = doc.paragraphs
+        if i >= len(paragraphs):
+            break
+        paragraph = paragraphs[i]
+        if paragraph_has_content(paragraph):
+            i += 1
+            continue
+        block_start = i
+        block_end = i
+        has_break = paragraph_has_page_break(paragraph)
+        while block_end + 1 < len(paragraphs):
+            next_paragraph = paragraphs[block_end + 1]
+            if paragraph_has_content(next_paragraph):
+                break
+            block_end += 1
+            if paragraph_has_page_break(next_paragraph):
+                has_break = True
+        next_index = block_end + 1
+        if has_break and block_start >= start_idx:
+            for pos in range(block_end, block_start - 1, -1):
+                par = doc.paragraphs[pos]
+                parent = par._element.getparent()
+                parent.remove(par._element)
+            removed_any = True
+        else:
+            i = next_index
+            continue
+        # after removal, continue from block_start (same index)
+        i = block_start
+    if removed_any:
+        doc.save(doc_path)
+
 # -----------------------------
 # МОДАЛЬНОЕ ОКНО АВТОРИЗАЦИИ
 # -----------------------------
@@ -181,6 +312,8 @@ st.title("Оценка авто")
 if "contractor" not in st.session_state:
     st.session_state["contractor"] = DEFAULT_CONTRACTOR
 
+ensure_analog_state()
+
 with st.form("auto_appraisal_form", clear_on_submit=False):
     col1, col2 = st.columns(2)
 
@@ -209,6 +342,57 @@ with st.form("auto_appraisal_form", clear_on_submit=False):
     appendix_1_files_raw = st.file_uploader("Приложение 1", accept_multiple_files=True, key="appendix_1")
     appendix_2_files_raw = st.file_uploader("Приложение 2", accept_multiple_files=True, key="appendix_2")
     rights_files_raw = st.file_uploader("Подтверждение права оценщика и исполнителя заниматься оценочной деятельностью", accept_multiple_files=True, key="rights_docs")
+
+    with st.expander("Объекты-аналоги", expanded=False):
+        slots = st.session_state.get("analog_slots", [])
+        st.caption("Добавляйте до 10 объектов-аналогов. Описания и фотографии попадут в шаблон отчета.")
+        if not slots:
+            st.info("Нажмите «Добавить объект-аналог», чтобы создать первый блок.")
+        for display_index, slot_id in enumerate(slots, start=1):
+            cols = st.columns([6, 1])
+            title_key = f"analog_title_{slot_id}"
+            default_value = st.session_state.get(title_key, default_analog_heading(display_index))
+            with cols[0]:
+                st.text_input(
+                    f"Название / описание для аналога №{display_index}",
+                    value=default_value,
+                    key=title_key,
+                    help="Это значение подставится в {{ object_analogN }}.",
+                )
+            with cols[1]:
+                st.form_submit_button(
+                    "Удалить",
+                    type="secondary",
+                    key=f"remove_analog_{slot_id}",
+                    on_click=remove_analog_slot,
+                    kwargs={"slot_id": slot_id},
+                    help="Удалить этот объект-аналог",
+                )
+            st.file_uploader(
+                f"Фотографии для аналога №{display_index}",
+                accept_multiple_files=True,
+                key=f"analog_files_{slot_id}",
+                help="Файлы будут размещены в {{ object_analogN_photo }}.",
+            )
+            source_key = f"analog_source_{slot_id}"
+            default_source = st.session_state.get(source_key, "")
+            st.text_input(
+                f"Источник для аналога №{display_index}",
+                value=default_source,
+                key=source_key,
+                help="Текст подставится в {{ a_sourceN }} и будет показан курсивом после фотографий.",
+                placeholder="https://...",
+            )
+            if display_index != len(slots):
+                st.divider()
+        st.form_submit_button(
+            "➕ Добавить объект-аналог",
+            key="add_analog_button",
+            type="secondary",
+            on_click=add_analog_slot,
+            disabled=len(slots) >= MAX_ANALOGS,
+            help="Добавить ещё один блок загрузки",
+        )
 
     submitted = st.form_submit_button("Сформировать и скачать DOCX", type="primary")
 
@@ -279,11 +463,66 @@ if submitted:
                 'size': len(payload),
             })
 
+    analog_slots_snapshot = st.session_state.get('analog_slots', [])
+    analog_results = []
+    analog_failures = []
+    for display_index, slot_id in enumerate(analog_slots_snapshot, start=1):
+        title_key = f"analog_title_{slot_id}"
+        raw_title = (st.session_state.get(title_key) or '').strip()
+        if not raw_title:
+            raw_title = default_analog_heading(display_index)
+        source_key = f"analog_source_{slot_id}"
+        raw_source = (st.session_state.get(source_key) or '').strip()
+        files_key = f"analog_files_{slot_id}"
+        uploaded_files = st.session_state.get(files_key) or []
+        slot_files = []
+        slot_failures = []
+        for uploaded_file in uploaded_files:
+            try:
+                payload = uploaded_file.getvalue()
+                if not payload:
+                    raise ValueError('empty payload')
+            except Exception:
+                fail_name = uploaded_file.name or ANALOG_EMPTY_TITLE
+                slot_failures.append(fail_name)
+                analog_failures.append(f"аналог №{display_index}: {fail_name}")
+            else:
+                slot_files.append({
+                    'name': uploaded_file.name or ANALOG_EMPTY_TITLE,
+                    'data': payload,
+                    'size': len(payload),
+                })
+        analog_results.append({
+            'index': display_index,
+            'slot_id': slot_id,
+            'title': raw_title,
+            'source': raw_source,
+            'files': slot_files,
+            'failures': slot_failures,
+        })
+
     appendix_1_names = [item['name'] for item in appendix_1_files]
     appendix_2_names = [item['name'] for item in appendix_2_files]
     rights_names = [item['name'] for item in rights_files]
     object_photo_names = [item['name'] for item in object_photos]
-    failed_uploads = appendix_1_failures + appendix_2_failures + rights_failures + object_photo_failures
+    failed_uploads = (
+        appendix_1_failures
+        + appendix_2_failures
+        + rights_failures
+        + object_photo_failures
+        + analog_failures
+    )
+
+    analog_record_entries = [
+        {
+            'Номер': item['index'],
+            'Название': item['title'],
+            'Файлы': [file['name'] for file in item['files']],
+            'Ошибки': item['failures'],
+            'Источник': format_analog_source_text(item['source']) if (item['files'] and item['source']) else '',
+        }
+        for item in analog_results
+    ]
 
     # Собираем запись
     record = {
@@ -310,6 +549,7 @@ if submitted:
         "Подтверждение права (файлы)": rights_names,
         # "Подтверждение права (ошибки)": rights_failures,
         "Фотографии объекта": object_photo_names,
+        "Объекты-аналоги": analog_record_entries,
     }
     st.success("Данные сохранены (локально в сессии).")
     with st.expander("Проверить данные перед подстановкой в шаблон"):
@@ -364,7 +604,33 @@ if submitted:
         context["appendix_1_entries"] = appendix_1_entries
         context["appendix_2_entries"] = appendix_2_entries
         context["rights_entries"] = rights_entries
-        context["object_ocenki"] = build_object_photos_subdoc(doc, object_photos)
+        context["object_ocenki"] = build_photos_subdoc(
+            doc,
+            object_photos,
+            empty_message="Фотографии объекта не загружены."
+        )
+        for idx in range(1, MAX_ANALOGS + 1):
+            if idx <= len(analog_results):
+                analog_item = analog_results[idx - 1]
+                context[f"object_analog{idx}"] = analog_item['title']
+                if analog_item['files'] and analog_item['source']:
+                    context[f"a_source{idx}"] = format_analog_source(analog_item['source'])
+                else:
+                    context[f"a_source{idx}"] = ""
+                empty_msg = "Фотографии объекта-аналога не загружены." if not analog_item['files'] else ''
+                context[f"object_analog{idx}_photo"] = build_photos_subdoc(
+                    doc,
+                    analog_item['files'],
+                    empty_message=empty_msg
+                )
+            else:
+                context[f"object_analog{idx}"] = ''
+                context[f"a_source{idx}"] = ""
+                context[f"object_analog{idx}_photo"] = build_photos_subdoc(
+                    doc,
+                    [],
+                    empty_message=''
+                )
 
         doc.render(context)
 
@@ -373,6 +639,9 @@ if submitted:
         out_path = GENERATED_DIR / out_name
 
         doc.save(str(out_path))
+
+        cleanup_unused_analog_pages(out_path, len(analog_results))
+
 
 
 
